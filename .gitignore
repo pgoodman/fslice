@@ -1,0 +1,8 @@
+*.o
+*.ll
+build/*
+llvm/*
+whole-program-llvm/*
+.project
+.cproject
+
