@@ -1,9 +1,12 @@
 /* Copyright 2015 Peter Goodman (peter@trailofbits.com), all rights reserved. */
 
-#include <llvm/IR/Function.h>
+#define DEBUG_TYPE "FSlice"
+
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Function.h"
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/LLVMContext.h>
 #include <llvm/Pass.h>
-#include <llvm/Transforms/Scalar.h>
 
 #include <iostream>
 #include <map>
@@ -26,7 +29,7 @@ struct IInfo {
   bool is_store;
   bool is_call;
   bool is_return;
-  bool is_used;
+  bool is_ignored;
 };
 
 // Introduces generic dynamic program slic recording into code.
@@ -45,42 +48,83 @@ class FSliceFunctionPass : public FunctionPass {
   static void combineVSet(VSet *VSet1, VSet *VSet2);
   static VSet *getVSet(VSet *VSet);
   void labelVSets(void);
-  void allocaVSetArray(Function &F);
-  void runOnInstructions(Function &F);
-  void runOnInstruction(Module *M, Function *F, const IInfo &II);
+  void allocaVSetArray(void);
+  void runOnInstructions(void);
+  void runOnLoad(const IInfo &II);
+  void runOnStore(const IInfo &II);
+
+  Value *getTaint(Value *V);
+
+  // Creates a function returning void on some arbitrary number of argument
+  // types.
+  template <typename... ParamTypes>
+  Function *CreateFunc(Type *RetTy, std::string name, std::string suffix,
+                       ParamTypes... Params) {
+    std::vector<Type *> FuncParamTypes = {Params...};
+    auto FuncType = llvm::FunctionType::get(RetTy, FuncParamTypes, false);
+    return dyn_cast<Function>(M->getOrInsertFunction(name + suffix, FuncType));
+  }
+
+  Function *F;
+  Module *M;
+  LLVMContext *C;
+  const DataLayout *DL;
+
+  Type *IntPtrTy;
+  Type *VoidTy;
 
   std::map<Argument *, VSet *> ArgToVSet;
   std::vector<IInfo> IIs;
   std::vector<VSet> VSets;
   std::map<Value *,VSet *> VtoVSet;
-  int vsetArrSize;
+  std::vector<Value *> IdxToVar;
+
+  int numVSets;
 };
 
 FSliceFunctionPass::FSliceFunctionPass(void)
     : FunctionPass(ID),
-      vsetArrSize(0) {}
+      F(nullptr),
+      M(nullptr),
+      C(nullptr),
+      DL(nullptr),
+      IntPtrTy(nullptr),
+      VoidTy(nullptr),
+      numVSets(0) {}
 
 // Instrument every instruction in a function.
-bool FSliceFunctionPass::runOnFunction(Function &F) {
-  if (F.begin() == F.end()) return false;
+bool FSliceFunctionPass::runOnFunction(Function &F_) {
+  F = &F_;
+  M = F->getParent();
+  C = &(M->getContext());
+  DL = M->getDataLayout();
+  IntPtrTy = Type::getIntNTy(*C,  DL->getPointerSizeInBits());
+  VoidTy = Type::getVoidTy(*C);
+  numVSets = 0;
 
-  F.dump();
+  if (F->begin() == F->end()) return false;
 
-  collectInstructions(F);
-  initVSets(F);
+  F->dump();
+
+  collectInstructions(*F);
+  initVSets(*F);
   combineVSets();
   labelVSets();
-  allocaVSetArray(F);
-  runOnInstructions(F);
+  allocaVSetArray();
+  runOnInstructions();
 
   for (auto V : VtoVSet) {
     V.first->dump();
     std::cout << "var: " << getVSet(V.second)->index << std::endl;
   }
 
+  F->dump();
+
+  ArgToVSet.clear();
   IIs.clear();
   VSets.clear();
   VtoVSet.clear();
+  IdxToVar.clear();
 
   return true;
 }
@@ -94,7 +138,7 @@ void FSliceFunctionPass::collectInstructions(Function &F) {
       IIs.push_back({&B, &I, isa<LoadInst>(I), isa<StoreInst>(I),
                      isa<CallInst>(I), isa<ReturnInst>(I),
                      !I.use_empty() && !isa<BranchInst>(I) &&
-                     !isa<InvokeInst>(I)});
+                     !isa<InvokeInst>(I) && !isa<CmpInst>(I)});
     }
   }
 }
@@ -118,7 +162,7 @@ void FSliceFunctionPass::initVSets(Function &F) {
     VSet->is_used = true;
   }
   for (auto &II : IIs) {
-    if (!II.is_used || II.is_store || II.is_return) continue;
+    if (!II.is_ignored || II.is_store || II.is_return) continue;
     auto VSet = &(VSets[i++]);
     VtoVSet[II.I] = VSet;
     VSet->is_used = true;
@@ -128,7 +172,7 @@ void FSliceFunctionPass::initVSets(Function &F) {
 // Combine value sets.
 void FSliceFunctionPass::combineVSets(void) {
   for (auto &II : IIs) {
-    if (!II.is_used || II.is_store || II.is_return) continue;
+    if (!II.is_ignored || II.is_store || II.is_return) continue;
     auto I = II.I;
     auto VSet = VtoVSet[I];
     if (PHINode *PHI = dyn_cast<PHINode>(I)) {
@@ -169,33 +213,92 @@ void FSliceFunctionPass::labelVSets(void) {
     if (!rVSet.is_used) continue;
     auto pVSet = getVSet(&rVSet);
     if (-1 == pVSet->index) {
-      pVSet->index = vsetArrSize++;
+      pVSet->index = numVSets++;
     }
   }
 }
 
 // Allocate an array to hold the slice taints for each variable in this
 // function.
-void FSliceFunctionPass::allocaVSetArray(Function &F) {
-  auto &B = F.getEntryBlock();
+void FSliceFunctionPass::allocaVSetArray(void) {
+  auto &B = F->getEntryBlock();
   auto &IList = B.getInstList();
   auto &FirstI = *IList.begin();
-  (void) FirstI;
+  for (auto i = 0; i < numVSets; ++i) {
+    auto taintVar = new AllocaInst(IntPtrTy);
+    IList.insert(FirstI, taintVar);
+    IdxToVar.push_back(taintVar);
+  }
 }
 
 // Instrument the original instructions.
-void FSliceFunctionPass::runOnInstructions(Function &F) {
-  auto M = F.getParent();
+void FSliceFunctionPass::runOnInstructions(void) {
   for (auto II : IIs) {
-    if (!II.is_used) continue;
-    runOnInstruction(M, &F, II);
+    if (II.is_load) {
+      runOnLoad(II);
+    } else if (II.is_store) {
+      runOnStore(II);
+    }
+  }
+}
+
+// Returns the size of a loaded/stored object.
+static uint64_t LoadStoreSize(const DataLayout *DL, Value *P) {
+  PointerType *PT = dyn_cast<PointerType>(P->getType());
+  return DL->getTypeStoreSize(PT->getElementType());
+}
+
+// Instrument a single instruction.
+void FSliceFunctionPass::runOnLoad(const IInfo &II) {
+  LoadInst *LI = dyn_cast<LoadInst>(II.I);
+  if (auto TV = getTaint(II.I)) {
+    auto &IList = II.B->getInstList();
+    auto P = LI->getPointerOperand();
+    auto S = LoadStoreSize(DL, P);
+    auto A = CastInst::CreatePointerCast(P, IntPtrTy);
+    auto LoadFunc = CreateFunc(IntPtrTy, "__fslice_load", std::to_string(S),
+                               IntPtrTy);
+    auto T = CallInst::Create(LoadFunc, {A});
+    IList.insert(II.I, A);
+    IList.insert(II.I, T);
+    IList.insert(II.I, new StoreInst(T, TV));
   }
 }
 
 // Instrument a single instruction.
-void FSliceFunctionPass::runOnInstruction(Module *M, Function *F,
-                                          const IInfo &II) {
+void FSliceFunctionPass::runOnStore(const IInfo &II) {
+  StoreInst *SI = dyn_cast<StoreInst>(II.I);
+  auto &IList = II.B->getInstList();
+  auto V = SI->getValueOperand();
+  auto P = SI->getPointerOperand();
+  auto S = LoadStoreSize(DL, P);
+  auto A = CastInst::CreatePointerCast(P, IntPtrTy);
 
+  if (auto TV = getTaint(V)) {
+    auto T = new LoadInst(TV);
+    std::vector<Value *> args = {T, A};
+    auto StoreFunc = CreateFunc(VoidTy, "__fslice_store", std::to_string(S),
+                                IntPtrTy, IntPtrTy);
+    IList.insert(II.I, T);
+    IList.insert(II.I, A);
+    IList.insert(II.I, CallInst::Create(StoreFunc, args));
+
+  } else {
+    auto ClearFunc = CreateFunc(VoidTy, "__fslice_clear", std::to_string(S),
+                                    IntPtrTy);
+    IList.insert(II.I, A);
+    IList.insert(II.I, CallInst::Create(ClearFunc, {A}));
+  }
+}
+
+Value *FSliceFunctionPass::getTaint(Value *V) {
+  if (VtoVSet.count(V)) {
+    return IdxToVar[VtoVSet[V]->index];
+  } else {
+    auto it = std::find(IdxToVar.begin(), IdxToVar.end(), V);
+    if (it == IdxToVar.end()) return nullptr;
+    return *it;
+  }
 }
 
 char FSliceFunctionPass::ID = '\0';
