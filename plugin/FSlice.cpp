@@ -2,10 +2,12 @@
 
 #define DEBUG_TYPE "FSlice"
 
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Function.h"
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
 #include <llvm/Pass.h>
 
 #include <iostream>
@@ -50,10 +52,14 @@ class FSliceFunctionPass : public FunctionPass {
   void labelVSets(void);
   void allocaVSetArray(void);
   void runOnInstructions(void);
+
   void runOnLoad(const IInfo &II);
   void runOnStore(const IInfo &II);
+  void runOnUnary(const IInfo &II, UnaryInstruction *I);
+  void runOnBinary(const IInfo &II, BinaryOperator *I);
 
   Value *getTaint(Value *V);
+  Value *LoadTaint(Instruction *I, Value *V);
 
   // Creates a function returning void on some arbitrary number of argument
   // types.
@@ -113,12 +119,9 @@ bool FSliceFunctionPass::runOnFunction(Function &F_) {
   allocaVSetArray();
   runOnInstructions();
 
-  for (auto V : VtoVSet) {
-    V.first->dump();
-    std::cout << "var: " << getVSet(V.second)->index << std::endl;
-  }
-
   F->dump();
+
+  std::cout << "\n\n\n" << std::endl;
 
   ArgToVSet.clear();
   IIs.clear();
@@ -238,6 +241,12 @@ void FSliceFunctionPass::runOnInstructions(void) {
       runOnLoad(II);
     } else if (II.is_store) {
       runOnStore(II);
+    } else if (!II.is_ignored) {
+      if (UnaryInstruction *UI = dyn_cast<UnaryInstruction>(II.I)) {
+        runOnUnary(II, UI);
+      } else if (BinaryOperator *BI = dyn_cast<BinaryOperator>(II.I)) {
+        runOnBinary(II, BI);
+      }
     }
   }
 }
@@ -265,6 +274,17 @@ void FSliceFunctionPass::runOnLoad(const IInfo &II) {
   }
 }
 
+Value *FSliceFunctionPass::LoadTaint(Instruction *I, Value *V) {
+  if (auto TV = getTaint(V)) {
+    auto &IList = I->getParent()->getInstList();
+    auto LT = new LoadInst(TV);
+    IList.insert(I, LT);
+    return LT;
+  } else {
+    return ConstantInt::get(IntPtrTy, 0, false);
+  }
+}
+
 // Instrument a single instruction.
 void FSliceFunctionPass::runOnStore(const IInfo &II) {
   StoreInst *SI = dyn_cast<StoreInst>(II.I);
@@ -274,21 +294,40 @@ void FSliceFunctionPass::runOnStore(const IInfo &II) {
   auto S = LoadStoreSize(DL, P);
   auto A = CastInst::CreatePointerCast(P, IntPtrTy);
 
-  if (auto TV = getTaint(V)) {
-    auto T = new LoadInst(TV);
-    std::vector<Value *> args = {T, A};
-    auto StoreFunc = CreateFunc(VoidTy, "__fslice_store", std::to_string(S),
-                                IntPtrTy, IntPtrTy);
-    IList.insert(II.I, T);
-    IList.insert(II.I, A);
-    IList.insert(II.I, CallInst::Create(StoreFunc, args));
+  auto T = LoadTaint(SI, V);
+  std::vector<Value *> args = {A, T};
+  auto StoreFunc = CreateFunc(VoidTy, "__fslice_store", std::to_string(S),
+                              IntPtrTy, IntPtrTy);
+  IList.insert(II.I, A);
+  IList.insert(II.I, CallInst::Create(StoreFunc, args));
+}
 
-  } else {
-    auto ClearFunc = CreateFunc(VoidTy, "__fslice_clear", std::to_string(S),
-                                    IntPtrTy);
-    IList.insert(II.I, A);
-    IList.insert(II.I, CallInst::Create(ClearFunc, {A}));
-  }
+void FSliceFunctionPass::runOnUnary(const IInfo &II, UnaryInstruction *I) {
+  if (isa<VAArgInst>(I)) return;
+  auto TD = getTaint(I);
+  if (!TD) return;
+
+  auto &IList = II.B->getInstList();
+  auto T = LoadTaint(I, I->getOperand(0));
+  IList.insert(II.I, new StoreInst(T, TD));
+}
+
+void FSliceFunctionPass::runOnBinary(const IInfo &II, BinaryOperator *I) {
+  auto TD = getTaint(I);
+  if (!TD) return;
+
+  auto &IList = II.B->getInstList();
+  auto LT = LoadTaint(I, I->getOperand(0));
+  auto RT = LoadTaint(I, I->getOperand(1));
+  auto Op = ConstantInt::get(IntPtrTy, I->getOpcode(), false);
+
+  std::vector<Value *> args = {Op, LT, RT};
+  auto Combiner = CreateFunc(IntPtrTy, "__fslice_combine", "",
+                             IntPtrTy, IntPtrTy, IntPtrTy);
+
+  auto TV = CallInst::Create(Combiner, args);
+  IList.insert(II.I, TV);
+  IList.insert(II.I, new StoreInst(TV, TD));
 }
 
 Value *FSliceFunctionPass::getTaint(Value *V) {
