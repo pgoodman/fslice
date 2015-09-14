@@ -31,8 +31,5 @@ cmake ../ \
 
 make -j`grep -c ^processor /proc/cpuinfo`
 
-mkdir $DIR/build
-cd $DIT/build
-
-cmake -G "Unix Makefiles" -DFSLICE_DIR=$DIR  ..
+cd $DIT
 make all

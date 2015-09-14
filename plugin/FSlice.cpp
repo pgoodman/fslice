@@ -6,6 +6,7 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Pass.h>
@@ -20,43 +21,43 @@ using namespace llvm;
 struct VSet {
   VSet *rep;
   int index;
-  bool is_used;
 };
 
 // Information about an instruction.
 struct IInfo {
   BasicBlock *B;
   Instruction *I;
-  bool is_load;
-  bool is_store;
-  bool is_call;
-  bool is_return;
-  bool is_ignored;
 };
 
 // Introduces generic dynamic program slic recording into code.
-class FSliceFunctionPass : public FunctionPass {
+class FSliceModulePass : public ModulePass {
  public:
-  FSliceFunctionPass(void);
+  FSliceModulePass(void);
 
-  virtual bool runOnFunction(Function &F) override;
+  virtual bool runOnModule(Module &M) override;
 
   static char ID;
 
  private:
-  void collectInstructions(Function &F);
-  void initVSets(Function &F);
+  void collectInstructions(void);
+  void initVSets(void);
   void combineVSets(void);
   static void combineVSet(VSet *VSet1, VSet *VSet2);
   static VSet *getVSet(VSet *VSet);
   void labelVSets(void);
   void allocaVSetArray(void);
+
+  void runOnFunction(void);
+  void runOnArgs(void);
   void runOnInstructions(void);
 
-  void runOnLoad(const IInfo &II);
-  void runOnStore(const IInfo &II);
-  void runOnUnary(const IInfo &II, UnaryInstruction *I);
-  void runOnBinary(const IInfo &II, BinaryOperator *I);
+  void runOnLoad(BasicBlock *B, LoadInst *LI);
+  void runOnStore(BasicBlock *B, StoreInst *SI);
+  void runOnCall(BasicBlock *B, CallInst *CI);
+  void runOnReturn(BasicBlock *B, ReturnInst *RI);
+  void runOnUnary(BasicBlock *B, UnaryInstruction *I);
+  void runOnBinary(BasicBlock *B, BinaryOperator *I);
+  void runOnIntrinsic(BasicBlock *B, MemIntrinsic *MI);
 
   Value *getTaint(Value *V);
   Value *LoadTaint(Instruction *I, Value *V);
@@ -78,6 +79,8 @@ class FSliceFunctionPass : public FunctionPass {
 
   Type *IntPtrTy;
   Type *VoidTy;
+  Type *VoidPtrTy;
+  Instruction *LastAlloca;
 
   std::map<Argument *, VSet *> ArgToVSet;
   std::vector<IInfo> IIs;
@@ -88,94 +91,100 @@ class FSliceFunctionPass : public FunctionPass {
   int numVSets;
 };
 
-FSliceFunctionPass::FSliceFunctionPass(void)
-    : FunctionPass(ID),
+FSliceModulePass::FSliceModulePass(void)
+    : ModulePass(ID),
       F(nullptr),
       M(nullptr),
       C(nullptr),
       DL(nullptr),
       IntPtrTy(nullptr),
       VoidTy(nullptr),
+      VoidPtrTy(nullptr),
+      LastAlloca(nullptr),
       numVSets(0) {}
 
-// Instrument every instruction in a function.
-bool FSliceFunctionPass::runOnFunction(Function &F_) {
-  F = &F_;
-  M = F->getParent();
+bool FSliceModulePass::runOnModule(Module &M_) {
+  M = &M_;
   C = &(M->getContext());
   DL = M->getDataLayout();
   IntPtrTy = Type::getIntNTy(*C,  DL->getPointerSizeInBits());
   VoidTy = Type::getVoidTy(*C);
+  VoidPtrTy = PointerType::getUnqual(IntegerType::getInt8Ty(*C));
+
+  for (auto &F_ : M->functions()) {
+    F = &F_;
+    if (F->isDeclaration()) {
+      if (F->getName() == "memset") {
+        F->setName("__fslice_memset");
+      } else if (F->getName() == "memcpy") {
+        F->setName("__fslice_memcpy");
+      } else if (F->getName() == "memmove") {
+        F->setName("__fslice_memmove");
+      } else if (F->getName() == "strcpy") {
+        F->setName("__fslice_strcpy");
+      } else if (F->getName() == "bzero") {
+        F->setName("__fslice_bzero");
+      }
+    } else {
+      runOnFunction();
+    }
+  }
+  return true;
+}
+
+// Instrument every instruction in a function.
+void FSliceModulePass::runOnFunction(void) {
   numVSets = 0;
-
-  if (F->begin() == F->end()) return false;
-
-  F->dump();
-
-  collectInstructions(*F);
-  initVSets(*F);
+  collectInstructions();
+  initVSets();
   combineVSets();
   labelVSets();
   allocaVSetArray();
+  runOnArgs();
   runOnInstructions();
-
-  F->dump();
-
-  std::cout << "\n\n\n" << std::endl;
-
   ArgToVSet.clear();
   IIs.clear();
   VSets.clear();
   VtoVSet.clear();
   IdxToVar.clear();
-
-  return true;
 }
 
 // Collect a list of all instructions. We'll be adding all sorts of new
 // instructions in so having a list makes it easy to operate on just the
 // originals.
-void FSliceFunctionPass::collectInstructions(Function &F) {
-  for (auto &B : F) {
+void FSliceModulePass::collectInstructions(void) {
+  for (auto &B : *F) {
     for (auto &I : B) {
-      IIs.push_back({&B, &I, isa<LoadInst>(I), isa<StoreInst>(I),
-                     isa<CallInst>(I), isa<ReturnInst>(I),
-                     !I.use_empty() && !isa<BranchInst>(I) &&
-                     !isa<InvokeInst>(I) && !isa<CmpInst>(I)});
+      IIs.push_back({&B, &I});
     }
   }
 }
 
 // Group the values (instructions, arguments) into sets where each set
 // represents a logical variable in the original program.
-void FSliceFunctionPass::initVSets(Function &F) {
-  VSets.resize(IIs.size() + F.arg_size());
+void FSliceModulePass::initVSets(void) {
+  VSets.resize(IIs.size() + F->arg_size());
 
   for (auto &VSet : VSets) {
     VSet.rep = &VSet;
     VSet.index = -1;
-    VSet.is_used = false;
   }
+
   auto i = 0UL;
-  for (auto &A : F.args()) {
-    if (A.use_empty()) continue;
+  for (auto &A : F->args()) {
     auto VSet = &(VSets[i++]);
     VtoVSet[&A] = VSet;
     ArgToVSet[&A] = VSet;
-    VSet->is_used = true;
   }
   for (auto &II : IIs) {
-    if (!II.is_ignored || II.is_store || II.is_return) continue;
     auto VSet = &(VSets[i++]);
     VtoVSet[II.I] = VSet;
-    VSet->is_used = true;
   }
 }
 
 // Combine value sets.
-void FSliceFunctionPass::combineVSets(void) {
+void FSliceModulePass::combineVSets(void) {
   for (auto &II : IIs) {
-    if (!II.is_ignored || II.is_store || II.is_return) continue;
     auto I = II.I;
     auto VSet = VtoVSet[I];
     if (PHINode *PHI = dyn_cast<PHINode>(I)) {
@@ -192,7 +201,7 @@ void FSliceFunctionPass::combineVSets(void) {
 }
 
 // Combine two value sets. This implements disjoint set union.
-void FSliceFunctionPass::combineVSet(VSet *VSet1, VSet *VSet2) {
+void FSliceModulePass::combineVSet(VSet *VSet1, VSet *VSet2) {
   VSet1 = getVSet(VSet1);
   VSet2 = getVSet(VSet2);
   if (VSet1 < VSet2) {
@@ -203,7 +212,7 @@ void FSliceFunctionPass::combineVSet(VSet *VSet1, VSet *VSet2) {
 }
 
 // Get the representative of this VSet. Implements union-find path compression.
-VSet *FSliceFunctionPass::getVSet(VSet *VSet) {
+VSet *FSliceModulePass::getVSet(VSet *VSet) {
   while (VSet->rep != VSet) {
     VSet = (VSet->rep = VSet->rep->rep);
   }
@@ -211,9 +220,8 @@ VSet *FSliceFunctionPass::getVSet(VSet *VSet) {
 }
 
 // Assign array indices to each VSet. This labels all variables from 0 to N-1.
-void FSliceFunctionPass::labelVSets(void) {
+void FSliceModulePass::labelVSets(void) {
   for (auto &rVSet : VSets) {
-    if (!rVSet.is_used) continue;
     auto pVSet = getVSet(&rVSet);
     if (-1 == pVSet->index) {
       pVSet->index = numVSets++;
@@ -223,30 +231,50 @@ void FSliceFunctionPass::labelVSets(void) {
 
 // Allocate an array to hold the slice taints for each variable in this
 // function.
-void FSliceFunctionPass::allocaVSetArray(void) {
+void FSliceModulePass::allocaVSetArray(void) {
   auto &B = F->getEntryBlock();
   auto &IList = B.getInstList();
   auto &FirstI = *IList.begin();
   for (auto i = 0; i < numVSets; ++i) {
-    auto taintVar = new AllocaInst(IntPtrTy);
-    IList.insert(FirstI, taintVar);
-    IdxToVar.push_back(taintVar);
+    auto TaintVar = new AllocaInst(IntPtrTy);
+    IList.insert(FirstI, TaintVar);
+    IdxToVar.push_back(TaintVar);
+    LastAlloca = TaintVar;
+  }
+}
+
+// Instrument the arguments.
+void FSliceModulePass::runOnArgs(void) {
+  if (!LastAlloca) return;
+  auto &IList = LastAlloca->getParent()->getInstList();
+  auto LoadFunc = CreateFunc(IntPtrTy, "__fslice_load_arg", "", IntPtrTy);
+  for (auto &A : F->args()) {
+    if (auto TA = getTaint(&A)) {
+      auto T = CallInst::Create(
+          LoadFunc, {ConstantInt::get(IntPtrTy, A.getArgNo(), false)});
+      IList.insertAfter(LastAlloca, new StoreInst(T, TA));
+      IList.insertAfter(LastAlloca, T);
+    }
   }
 }
 
 // Instrument the original instructions.
-void FSliceFunctionPass::runOnInstructions(void) {
+void FSliceModulePass::runOnInstructions(void) {
   for (auto II : IIs) {
-    if (II.is_load) {
-      runOnLoad(II);
-    } else if (II.is_store) {
-      runOnStore(II);
-    } else if (!II.is_ignored) {
-      if (UnaryInstruction *UI = dyn_cast<UnaryInstruction>(II.I)) {
-        runOnUnary(II, UI);
-      } else if (BinaryOperator *BI = dyn_cast<BinaryOperator>(II.I)) {
-        runOnBinary(II, BI);
-      }
+    if (LoadInst *LI = dyn_cast<LoadInst>(II.I)) {
+      runOnLoad(II.B, LI);
+    } else if (StoreInst *SI = dyn_cast<StoreInst>(II.I)) {
+      runOnStore(II.B, SI);
+    } else if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(II.I)) {
+      runOnIntrinsic(II.B, MI);
+    } else if (CallInst *CI = dyn_cast<CallInst>(II.I)) {
+      runOnCall(II.B, CI);
+    } else if (ReturnInst *RI = dyn_cast<ReturnInst>(II.I)) {
+      runOnReturn(II.B, RI);
+    } else if (UnaryInstruction *UI = dyn_cast<UnaryInstruction>(II.I)) {
+      runOnUnary(II.B, UI);
+    } else if (BinaryOperator *BI = dyn_cast<BinaryOperator>(II.I)) {
+      runOnBinary(II.B, BI);
     }
   }
 }
@@ -258,23 +286,24 @@ static uint64_t LoadStoreSize(const DataLayout *DL, Value *P) {
 }
 
 // Instrument a single instruction.
-void FSliceFunctionPass::runOnLoad(const IInfo &II) {
-  LoadInst *LI = dyn_cast<LoadInst>(II.I);
-  if (auto TV = getTaint(II.I)) {
-    auto &IList = II.B->getInstList();
+void FSliceModulePass::runOnLoad(BasicBlock *B, LoadInst *LI) {
+  if (auto TV = getTaint(LI)) {
+    auto &IList = B->getInstList();
     auto P = LI->getPointerOperand();
     auto S = LoadStoreSize(DL, P);
     auto A = CastInst::CreatePointerCast(P, IntPtrTy);
     auto LoadFunc = CreateFunc(IntPtrTy, "__fslice_load", std::to_string(S),
                                IntPtrTy);
     auto T = CallInst::Create(LoadFunc, {A});
-    IList.insert(II.I, A);
-    IList.insert(II.I, T);
-    IList.insert(II.I, new StoreInst(T, TV));
+    IList.insert(LI, A);
+    IList.insert(LI, T);
+    IList.insert(LI, new StoreInst(T, TV));
   }
 }
 
-Value *FSliceFunctionPass::LoadTaint(Instruction *I, Value *V) {
+// Get a value that contains the tainted data for a local variable, or zero if
+// the variable isn't tainted.
+Value *FSliceModulePass::LoadTaint(Instruction *I, Value *V) {
   if (auto TV = getTaint(V)) {
     auto &IList = I->getParent()->getInstList();
     auto LT = new LoadInst(TV);
@@ -286,9 +315,8 @@ Value *FSliceFunctionPass::LoadTaint(Instruction *I, Value *V) {
 }
 
 // Instrument a single instruction.
-void FSliceFunctionPass::runOnStore(const IInfo &II) {
-  StoreInst *SI = dyn_cast<StoreInst>(II.I);
-  auto &IList = II.B->getInstList();
+void FSliceModulePass::runOnStore(BasicBlock *B, StoreInst *SI) {
+  auto &IList = B->getInstList();
   auto V = SI->getValueOperand();
   auto P = SI->getPointerOperand();
   auto S = LoadStoreSize(DL, P);
@@ -298,25 +326,59 @@ void FSliceFunctionPass::runOnStore(const IInfo &II) {
   std::vector<Value *> args = {A, T};
   auto StoreFunc = CreateFunc(VoidTy, "__fslice_store", std::to_string(S),
                               IntPtrTy, IntPtrTy);
-  IList.insert(II.I, A);
-  IList.insert(II.I, CallInst::Create(StoreFunc, args));
+  IList.insert(SI, A);
+  IList.insert(SI, CallInst::Create(StoreFunc, args));
 }
 
-void FSliceFunctionPass::runOnUnary(const IInfo &II, UnaryInstruction *I) {
+void FSliceModulePass::runOnCall(BasicBlock *B, CallInst *CI) {
+  if (auto F = CI->getCalledFunction()) {
+    if (F->isDeclaration()) return;
+  }
+
+  auto &IList = B->getInstList();
+  auto StoreFunc = CreateFunc(VoidTy, "__fslice_store_arg", "",
+                              IntPtrTy, IntPtrTy);
+  auto i = 0UL;
+  for (auto &A : CI->arg_operands()) {
+    std::vector<Value *> args = {ConstantInt::get(IntPtrTy, i++, false),
+                                 LoadTaint(CI, A.get())};
+    IList.insert(CI, CallInst::Create(StoreFunc, args));
+  }
+
+  if (CI->user_empty()) return;
+
+  if (auto RT = getTaint(CI)) {
+    auto LoadFunc = CreateFunc(IntPtrTy, "__fslice_load_ret", "");
+    auto TR = CallInst::Create(LoadFunc);
+    IList.insertAfter(CI, new StoreInst(TR, RT));
+    IList.insertAfter(CI, TR);
+  }
+}
+
+void FSliceModulePass::runOnReturn(BasicBlock *B, ReturnInst *RI) {
+  if (auto RV = RI->getReturnValue()) {
+    auto &IList = B->getInstList();
+    auto StoreFunc = CreateFunc(VoidTy, "__fslice_store_ret", "",
+                                IntPtrTy);
+    IList.insert(RI, CallInst::Create(StoreFunc, {LoadTaint(RI, RV)}));
+  }
+}
+
+void FSliceModulePass::runOnUnary(BasicBlock *B, UnaryInstruction *I) {
   if (isa<VAArgInst>(I)) return;
   auto TD = getTaint(I);
   if (!TD) return;
 
-  auto &IList = II.B->getInstList();
+  auto &IList = B->getInstList();
   auto T = LoadTaint(I, I->getOperand(0));
-  IList.insert(II.I, new StoreInst(T, TD));
+  IList.insert(I, new StoreInst(T, TD));
 }
 
-void FSliceFunctionPass::runOnBinary(const IInfo &II, BinaryOperator *I) {
+void FSliceModulePass::runOnBinary(BasicBlock *B, BinaryOperator *I) {
   auto TD = getTaint(I);
   if (!TD) return;
 
-  auto &IList = II.B->getInstList();
+  auto &IList = B->getInstList();
   auto LT = LoadTaint(I, I->getOperand(0));
   auto RT = LoadTaint(I, I->getOperand(1));
   auto Op = ConstantInt::get(IntPtrTy, I->getOpcode(), false);
@@ -326,13 +388,43 @@ void FSliceFunctionPass::runOnBinary(const IInfo &II, BinaryOperator *I) {
                              IntPtrTy, IntPtrTy, IntPtrTy);
 
   auto TV = CallInst::Create(Combiner, args);
-  IList.insert(II.I, TV);
-  IList.insert(II.I, new StoreInst(TV, TD));
+  IList.insert(I, TV);
+  IList.insert(I, new StoreInst(TV, TD));
 }
 
-Value *FSliceFunctionPass::getTaint(Value *V) {
+void FSliceModulePass::runOnIntrinsic(BasicBlock *B, MemIntrinsic *MI) {
+  const char *FName = nullptr;
+  auto CastOp = Instruction::PtrToInt;
+  if (isa<MemSetInst>(MI)) {
+    CastOp = Instruction::ZExt;
+    FName = "__fslice_memset";
+  } else if (isa<MemCpyInst>(MI)) {
+    FName = "__fslice_memcpy";
+  } else if (isa<MemMoveInst>(MI)) {
+    FName = "__fslice_memmove";
+  } else {
+    return;
+  }
+
+  auto &IList = B->getInstList();
+  auto MemF = CreateFunc(VoidPtrTy, FName, "", IntPtrTy, IntPtrTy, IntPtrTy);
+  auto MDest = CastInst::CreatePointerCast(MI->getRawDest(), IntPtrTy);
+  IList.insert(MI, MDest);
+
+  auto Src = CastInst::Create(CastOp, MI->getArgOperand(1), IntPtrTy);
+  IList.insert(MI, Src);
+
+  std::vector<Value *> args = {MDest, Src, MI->getLength()};
+  IList.insert(MI, CallInst::Create(MemF, args));
+
+  MI->eraseFromParent();
+}
+
+Value *FSliceModulePass::getTaint(Value *V) {
   if (VtoVSet.count(V)) {
-    return IdxToVar[VtoVSet[V]->index];
+    auto index = VtoVSet[V]->index;
+    if (-1 == index) return nullptr;
+    return IdxToVar[index];
   } else {
     auto it = std::find(IdxToVar.begin(), IdxToVar.end(), V);
     if (it == IdxToVar.end()) return nullptr;
@@ -340,9 +432,9 @@ Value *FSliceFunctionPass::getTaint(Value *V) {
   }
 }
 
-char FSliceFunctionPass::ID = '\0';
+char FSliceModulePass::ID = '\0';
 
-static RegisterPass<FSliceFunctionPass> X(
+static RegisterPass<FSliceModulePass> X(
     "fslice",
     "File system runtime program slicing pass.",
     false,  // Only looks at CFG.
