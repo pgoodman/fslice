@@ -72,6 +72,23 @@ class FSliceModulePass : public ModulePass {
     return dyn_cast<Function>(M->getOrInsertFunction(name + suffix, FuncType));
   }
 
+  Value *CreateString(const char *str) {
+    auto &Val = StrValues[str];
+    if (Val) return Val;
+
+    auto GStr = new GlobalVariable(
+      *M,
+      ArrayType::get(IntegerType::get(*C, 8), strlen(str) + 1),
+      true,
+      GlobalValue::PrivateLinkage,
+      ConstantDataArray::getString(*C, str, true));
+
+    auto Zero = ConstantInt::get(IntPtrTy, 0, false);
+    std::vector<Value *> Indices = {Zero, Zero};
+    Val = ConstantExpr::getGetElementPtr(GStr, Indices);
+    return Val;
+  }
+
   Function *F;
   Module *M;
   LLVMContext *C;
@@ -87,6 +104,7 @@ class FSliceModulePass : public ModulePass {
   std::vector<VSet> VSets;
   std::map<Value *,VSet *> VtoVSet;
   std::vector<Value *> IdxToVar;
+  std::map<const char *,Value *> StrValues;
 
   int numVSets;
 };
@@ -304,14 +322,29 @@ void FSliceModulePass::runOnLoad(BasicBlock *B, LoadInst *LI) {
 // Get a value that contains the tainted data for a local variable, or zero if
 // the variable isn't tainted.
 Value *FSliceModulePass::LoadTaint(Instruction *I, Value *V) {
+  auto &IList = I->getParent()->getInstList();
+  Instruction *RV = nullptr;
   if (auto TV = getTaint(V)) {
-    auto &IList = I->getParent()->getInstList();
-    auto LT = new LoadInst(TV);
-    IList.insert(I, LT);
-    return LT;
+    RV = new LoadInst(TV);
   } else {
-    return ConstantInt::get(IntPtrTy, 0, false);
+    auto VT = V->getType();
+    if (IntegerType *IT = dyn_cast<IntegerType>(VT)) {
+      Instruction *CV = nullptr;
+      if (IT->isIntegerTy(IntPtrTy->getPrimitiveSizeInBits())) {
+        CV = CastInst::CreateBitOrPointerCast(V, IntPtrTy);
+      } else {
+        CV = CastInst::Create(Instruction::ZExt, V, IntPtrTy);
+      }
+      IList.insert(I, CV);
+      auto ValueFunc = CreateFunc(IntPtrTy, "__fslice_value", "",
+                                  IntPtrTy);
+      RV = CallInst::Create(ValueFunc, {CV});
+    } else {
+      return ConstantInt::get(IntPtrTy, 0, false);
+    }
   }
+  IList.insert(I, RV);
+  return RV;
 }
 
 // Instrument a single instruction.
@@ -373,8 +406,17 @@ void FSliceModulePass::runOnUnary(BasicBlock *B, UnaryInstruction *I) {
 
   auto &IList = B->getInstList();
   auto T = LoadTaint(I, I->getOperand(0));
-  IList.insert(I, new StoreInst(T, TD));
+  auto Op = CreateString(I->getOpcodeName());
+  auto Operator = CreateFunc(IntPtrTy, "__fslice_op1", "",
+                             Op->getType(), IntPtrTy);
+
+  std::vector<Value *> args = {Op, T};
+  auto TV = CallInst::Create(Operator, args);
+  IList.insert(I, TV);
+  IList.insert(I, new StoreInst(TV, TD));
 }
+
+
 
 void FSliceModulePass::runOnBinary(BasicBlock *B, BinaryOperator *I) {
   auto TD = getTaint(I);
@@ -383,13 +425,12 @@ void FSliceModulePass::runOnBinary(BasicBlock *B, BinaryOperator *I) {
   auto &IList = B->getInstList();
   auto LT = LoadTaint(I, I->getOperand(0));
   auto RT = LoadTaint(I, I->getOperand(1));
-  auto Op = ConstantInt::get(IntPtrTy, I->getOpcode(), false);
+  auto Op = CreateString(I->getOpcodeName());
+  auto Operator = CreateFunc(IntPtrTy, "__fslice_op2", "",
+                             Op->getType(), IntPtrTy, IntPtrTy);
 
   std::vector<Value *> args = {Op, LT, RT};
-  auto Combiner = CreateFunc(IntPtrTy, "__fslice_combine", "",
-                             IntPtrTy, IntPtrTy, IntPtrTy);
-
-  auto TV = CallInst::Create(Combiner, args);
+  auto TV = CallInst::Create(Operator, args);
   IList.insert(I, TV);
   IList.insert(I, new StoreInst(TV, TD));
 }

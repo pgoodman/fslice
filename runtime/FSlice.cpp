@@ -14,21 +14,26 @@ struct Taint {
   uint64_t id:48;
 } __attribute__((packed));
 
-static Taint gArgs[16] = {{0}};
-static Taint gReturn = {0};
+static Taint gArgs[16] = {{0,0}};
+static Taint gReturn = {0,0};
 static std::unordered_map<uintptr_t,Taint> gShadow;
+static std::unordered_map<uintptr_t,Taint> gValues;
 static unsigned gId = 1;
+
+extern "C" Taint __fslice_value(uintptr_t);
 
 static void Select(Taint t, unsigned offset) {
   if (t.id) {
     std::cerr << "t" << t.id << "[" << (t.offset + offset) << "]";
+  } else if (gValues[0].id) {
+    std::cerr << "t" << gValues[0].id << "[0]";
   } else {
-    std::cerr << "0";
+    std::cerr << "Val(0)[0]";
   }
 }
 
 // Load a taint from the shadow memory.
-Taint Load(uintptr_t addr, size_t size) {
+static Taint Load(uintptr_t addr, size_t size) {
 
   // If we're only loading uninitialized memory, then return zero.
   auto initial_taint = gShadow[addr];
@@ -38,7 +43,7 @@ Taint Load(uintptr_t addr, size_t size) {
         goto use_existing_obj;
       }
     }
-    return {0,0};
+    return __fslice_value(0);
   }
 
   // If we're loading contiguous memory all from the same tainted object then
@@ -72,7 +77,7 @@ make_obj:
 }
 
 // Store a taint to the shadow memory.
-void Store(uintptr_t addr, size_t size, Taint taint) {
+static void Store(uintptr_t addr, size_t size, Taint taint) {
   if (!taint.id) return;
   for (auto i = 0U; i < size; ++i) {
     gShadow[addr + i] = {taint.id, taint.offset + i};
@@ -142,14 +147,33 @@ char *__fslice_strcpy(char *dst, const char *src) {
   return reinterpret_cast<char *>(__fslice_memmove(dst, src, strlen(src)));
 }
 
-Taint __fslice_combine(uintptr_t op, Taint t1,
-                                 Taint t2) {
-  if (!t1.id && !t2.id) return {0,0};
+Taint __fslice_value(uintptr_t val) {
+  auto &t = gValues[val];
+  if (!t.id) {
+    t.id = gId++;
+    t.offset = 0;
+    std::cerr << "t" << t.id << " = Val(0x" << std::hex << val << std::dec
+              << ")" << std::endl;
+  }
+  return t;
+}
+
+Taint __fslice_op1(const char *op, Taint t1) {
+  Taint t;
+  t.id = gId++;
+  t.offset = 0;
+  std::cerr << "t" << t.id << " = Op1(\"" << op << "\",t" << t1.id
+            << ")" << std::endl;
+  return t;
+}
+
+Taint __fslice_op2(const char *op, Taint t1, Taint t2) {
+  if (!t1.id && !t2.id) return __fslice_value(0);
 
   Taint t;
   t.id = gId++;
   t.offset = 0;
-  std::cerr << "t" << t.id << " = Combine(" << op << ",t" << t1.id
+  std::cerr << "t" << t.id << " = Op2(\"" << op << "\",t" << t1.id
             << ",t" << t2.id << ")" << std::endl;
   return t;
 }
