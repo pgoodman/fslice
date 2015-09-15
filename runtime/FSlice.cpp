@@ -6,8 +6,6 @@
 #include <iostream>
 #include <fstream>
 
-typedef uintptr_t Taint;
-
 inline namespace __fslice {
 namespace {
 
@@ -87,10 +85,10 @@ void Store(uintptr_t addr, size_t size, Taint taint) {
 extern "C" {
 
 #define LOAD_STORE(size) \
-  __fslice::Taint __fslice_load ## size (uintptr_t addr) { \
+  Taint __fslice_load ## size (uintptr_t addr) { \
     return Load(addr, size); \
   } \
-  void __fslice_store ## size (uintptr_t addr, __fslice::Taint taint) { \
+  void __fslice_store ## size (uintptr_t addr, Taint taint) { \
     Store(addr, size, taint); \
   }
 
@@ -102,43 +100,53 @@ LOAD_STORE(16)
 LOAD_STORE(32)
 LOAD_STORE(64)
 
-__fslice::Taint __fslice_load_ret(void) {
+Taint __fslice_load_ret(void) {
   return gReturn;
 }
 
-void __fslice_store_ret(__fslice::Taint taint) {
+void __fslice_store_ret(Taint taint) {
   gReturn = taint;
 }
 
-__fslice::Taint __fslice_load_arg(uintptr_t i) {
+Taint __fslice_load_arg(uintptr_t i) {
   return gArgs[i];
 }
 
-void __fslice_store_arg(uintptr_t i, __fslice::Taint taint) {
+void __fslice_store_arg(uintptr_t i, Taint taint) {
   gArgs[i] = taint;
 }
 
-char *__fslice_strcpy(char *dst, const char *src) {
-  return strcpy(dst, src);
-}
-
 void *__fslice_memset(void *dst, int val, size_t size) {
+  auto t = __fslice_load_arg(1);
+  auto daddr = reinterpret_cast<uintptr_t>(dst);
+  for (auto i = 0U; i < size; ++i) {
+    gShadow[daddr + i] = {t.id, 0};
+  }
   return memset(dst, val, size);
 }
 
-void *__fslice_memcpy(void *dst, const void *src, size_t size) {
-  return memcpy(dst, src, size);
-}
-
 void *__fslice_memmove(void *dst, const void *src, size_t size) {
+  auto daddr = reinterpret_cast<uintptr_t>(dst);
+  auto saddr = reinterpret_cast<uintptr_t>(src);
+  for (auto i = 0U; i < size; ++i) {
+    gShadow[daddr + i] = gShadow[saddr + i];  // Not right but whatever.
+  }
   return memmove(dst, src, size);
 }
 
-__fslice::Taint __fslice_combine(uintptr_t op, __fslice::Taint t1,
-                                 __fslice::Taint t2) {
+void *__fslice_memcpy(void *dst, const void *src, size_t size) {
+  return __fslice_memmove(dst, src, size);
+}
+
+char *__fslice_strcpy(char *dst, const char *src) {
+  return reinterpret_cast<char *>(__fslice_memmove(dst, src, strlen(src)));
+}
+
+Taint __fslice_combine(uintptr_t op, Taint t1,
+                                 Taint t2) {
   if (!t1.id && !t2.id) return {0,0};
 
-  __fslice::Taint t;
+  Taint t;
   t.id = gId++;
   t.offset = 0;
   std::cerr << "t" << t.id << " = Combine(" << op << ",t" << t1.id

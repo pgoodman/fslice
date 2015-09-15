@@ -332,7 +332,9 @@ void FSliceModulePass::runOnStore(BasicBlock *B, StoreInst *SI) {
 
 void FSliceModulePass::runOnCall(BasicBlock *B, CallInst *CI) {
   if (auto F = CI->getCalledFunction()) {
-    if (F->isDeclaration()) return;
+    if (F->isDeclaration() &&
+        F->getName() != "memset" &&
+        F->getName() != "__fslice_memset") return;
   }
 
   auto &IList = B->getInstList();
