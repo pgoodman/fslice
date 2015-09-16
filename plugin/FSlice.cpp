@@ -97,7 +97,7 @@ class FSliceModulePass : public ModulePass {
   Type *IntPtrTy;
   Type *VoidTy;
   Type *VoidPtrTy;
-  Instruction *LastAlloca;
+  Instruction *AfterAlloca;
 
   std::map<Argument *, VSet *> ArgToVSet;
   std::vector<IInfo> IIs;
@@ -118,7 +118,7 @@ FSliceModulePass::FSliceModulePass(void)
       IntPtrTy(nullptr),
       VoidTy(nullptr),
       VoidPtrTy(nullptr),
-      LastAlloca(nullptr),
+      AfterAlloca(nullptr),
       numVSets(0) {}
 
 bool FSliceModulePass::runOnModule(Module &M_) {
@@ -256,22 +256,24 @@ void FSliceModulePass::allocaVSetArray(void) {
   for (auto i = 0; i < numVSets; ++i) {
     auto TaintVar = new AllocaInst(IntPtrTy);
     IList.insert(FirstI, TaintVar);
+    IList.insert(FirstI, new StoreInst(ConstantInt::get(IntPtrTy, 0, false),
+                                       TaintVar));
     IdxToVar.push_back(TaintVar);
-    LastAlloca = TaintVar;
   }
+  AfterAlloca = &FirstI;
 }
 
 // Instrument the arguments.
 void FSliceModulePass::runOnArgs(void) {
-  if (!LastAlloca) return;
-  auto &IList = LastAlloca->getParent()->getInstList();
+  if (!AfterAlloca) return;
+  auto &IList = AfterAlloca->getParent()->getInstList();
   auto LoadFunc = CreateFunc(IntPtrTy, "__fslice_load_arg", "", IntPtrTy);
   for (auto &A : F->args()) {
     if (auto TA = getTaint(&A)) {
       auto T = CallInst::Create(
           LoadFunc, {ConstantInt::get(IntPtrTy, A.getArgNo(), false)});
-      IList.insertAfter(LastAlloca, new StoreInst(T, TA));
-      IList.insertAfter(LastAlloca, T);
+      IList.insert(AfterAlloca, T);
+      IList.insert(AfterAlloca, new StoreInst(T, TA));
     }
   }
 }
@@ -289,8 +291,8 @@ void FSliceModulePass::runOnInstructions(void) {
       runOnCall(II.B, CI);
     } else if (ReturnInst *RI = dyn_cast<ReturnInst>(II.I)) {
       runOnReturn(II.B, RI);
-    } else if (UnaryInstruction *UI = dyn_cast<UnaryInstruction>(II.I)) {
-      runOnUnary(II.B, UI);
+    //} else if (UnaryInstruction *UI = dyn_cast<UnaryInstruction>(II.I)) {
+    //  runOnUnary(II.B, UI);
     } else if (BinaryOperator *BI = dyn_cast<BinaryOperator>(II.I)) {
       runOnBinary(II.B, BI);
     }
@@ -327,8 +329,7 @@ Value *FSliceModulePass::LoadTaint(Instruction *I, Value *V) {
   if (auto TV = getTaint(V)) {
     RV = new LoadInst(TV);
   } else {
-    auto VT = V->getType();
-    if (IntegerType *IT = dyn_cast<IntegerType>(VT)) {
+    if (IntegerType *IT = dyn_cast<IntegerType>(V->getType())) {
       Instruction *CV = nullptr;
       if (IT->isIntegerTy(IntPtrTy->getPrimitiveSizeInBits())) {
         CV = CastInst::CreateBitOrPointerCast(V, IntPtrTy);
@@ -364,12 +365,6 @@ void FSliceModulePass::runOnStore(BasicBlock *B, StoreInst *SI) {
 }
 
 void FSliceModulePass::runOnCall(BasicBlock *B, CallInst *CI) {
-  if (auto F = CI->getCalledFunction()) {
-    if (F->isDeclaration() &&
-        F->getName() != "memset" &&
-        F->getName() != "__fslice_memset") return;
-  }
-
   auto &IList = B->getInstList();
   auto StoreFunc = CreateFunc(VoidTy, "__fslice_store_arg", "",
                               IntPtrTy, IntPtrTy);
@@ -399,24 +394,15 @@ void FSliceModulePass::runOnReturn(BasicBlock *B, ReturnInst *RI) {
   }
 }
 
+
 void FSliceModulePass::runOnUnary(BasicBlock *B, UnaryInstruction *I) {
-  if (isa<VAArgInst>(I)) return;
+  if (!isa<CastInst>(I)) return;
   auto TD = getTaint(I);
   if (!TD) return;
-
   auto &IList = B->getInstList();
   auto T = LoadTaint(I, I->getOperand(0));
-  auto Op = CreateString(I->getOpcodeName());
-  auto Operator = CreateFunc(IntPtrTy, "__fslice_op1", "",
-                             Op->getType(), IntPtrTy);
-
-  std::vector<Value *> args = {Op, T};
-  auto TV = CallInst::Create(Operator, args);
-  IList.insert(I, TV);
-  IList.insert(I, new StoreInst(TV, TD));
+  IList.insert(I, new StoreInst(T, TD));
 }
-
-
 
 void FSliceModulePass::runOnBinary(BasicBlock *B, BinaryOperator *I) {
   auto TD = getTaint(I);
@@ -464,6 +450,7 @@ void FSliceModulePass::runOnIntrinsic(BasicBlock *B, MemIntrinsic *MI) {
 }
 
 Value *FSliceModulePass::getTaint(Value *V) {
+  if (V->getType()->isFPOrFPVectorTy()) return nullptr;
   if (VtoVSet.count(V)) {
     auto index = VtoVSet[V]->index;
     if (-1 == index) return nullptr;
