@@ -31,5 +31,16 @@ cmake ../ \
 
 make -j`grep -c ^processor /proc/cpuinfo`
 
-cd $DIT
+cd $DIR
 make all
+
+# Get testfs and instrument it.
+git clone git@github.com:pgoodman/testfs.git
+./env.sh make -C testfs clean all
+./run.sh testfs/testfs
+
+echo "Usage:"
+echo "$DIR/testfs/mktestfs /tmp/fs"
+echo "$DIR/testfs/testfs.exe /tmp/fs 2> /tmp/testfs.py"
+echo "$DIR/visualize.sh /tmp/testfs.py"
+echo
