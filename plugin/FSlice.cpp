@@ -142,6 +142,10 @@ bool FSliceModulePass::runOnModule(Module &M_) {
         F->setName("__fslice_strcpy");
       } else if (F->getName() == "bzero") {
         F->setName("__fslice_bzero");
+      } else if (F->getName() == "malloc") {
+        F->setName("__fslice_malloc");
+      } else if (F->getName() == "calloc") {
+        F->setName("__fslice_calloc");
       }
     } else {
       runOnFunction();
